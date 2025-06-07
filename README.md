@@ -1,1 +1,314 @@
 # project-in-AI
+This is the project can Analysis AI Dreven virtual keyboard and mouse with hand gesture and voice controll
+import cv2
+import mediapipe as mp
+import numpy as np
+import pyautogui
+import os
+import pygetwindow as gw
+import time
+import speech_recognition as sr
+from comtypes import CLSCTX_ALL
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+import threading
+import queue
+
+# Initialize MediaPipe Hands
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+hands = mp_hands.Hands(min_detection_confidence=0.8, min_tracking_confidence=0.7, max_num_hands=1)
+
+# OpenCV Video Capture
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+# Initialize volume control
+devices = AudioUtilities.GetSpeakers()
+interface = devices.Activate(IAudioEndpointVolume.iid, CLSCTX_ALL, None)
+volume = interface.QueryInterface(IAudioEndpointVolume)
+
+# Initialize speech recognition
+recognizer = sr.Recognizer()
+microphone = sr.Microphone(device_index=2)  # REPLACE 2 WITH YOUR CORRECT DEVICE INDEX
+command_queue = queue.Queue()
+recording_signals = queue.Queue()
+
+# Virtual Keyboard Layout
+keyboard = [
+    ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '⌫'],
+    ['Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'],
+    ['A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ';'],
+    ['Z', 'X', 'C', 'V', 'B', 'N', 'M', ',', '.', '/'],
+    ['Min', 'Max', 'Open', 'Enter', 'Sound', 'Voice']
+]
+
+# Variables
+is_minimized = False
+volume_mode = False
+voice_mode = False
+last_action_time = 0
+debounce_time = 0.15
+text_display = ""
+key_width, key_height, key_gap = 50, 50, 8
+screen_width, screen_height = pyautogui.size()
+circle_radius = 11
+scroll_speed = 20
+prev_pinch_y = None
+last_recording_start = 0
+
+# Voice command display variables
+voice_status = ""
+voice_command_display = ""
+voice_activation_time = 0
+
+# Bright color palette (BGR)
+COLOR_DEFAULT = (255, 165, 0)
+COLOR_ACTIVE = (0, 255, 255)
+COLOR_SOUND = (0, 255, 0)
+COLOR_TEXT = (255, 255, 255)
+COLOR_INDEX = (0, 255, 0)
+COLOR_THUMB = (255, 0, 0)
+COLOR_MIDDLE = (0, 0, 255)
+COLOR_VOICE = (255, 0, 255)
+
+# Check active window
+def check_active_window():
+    global is_minimized
+    active_window = gw.getActiveWindow()
+    if active_window and "Virtual Keyboard" in active_window.title:
+        is_minimized = False
+
+# Draw keyboard
+def draw_keyboard(frame, start_x, start_y, active_key=None):
+    search_bar_y = start_y - key_height - 10
+    cv2.rectangle(frame, (start_x, search_bar_y), (start_x + len(keyboard[0]) * (key_width + key_gap), search_bar_y + key_height), (200, 200, 200), -1)
+    cv2.putText(frame, text_display, (start_x + 5, search_bar_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+    
+    if voice_status:
+        cv2.putText(frame, voice_status, (start_x, search_bar_y - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_VOICE, 2)
+    if voice_command_display:
+        cv2.putText(frame, voice_command_display, (start_x, search_bar_y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_VOICE, 2)
+    
+    for i, row in enumerate(keyboard):
+        for j, key in enumerate(row):
+            x = start_x + j * (key_width + key_gap)
+            y = start_y + i * (key_height + key_gap)
+            color = COLOR_ACTIVE if key == active_key else (
+                COLOR_SOUND if (key == 'Sound' and volume_mode) else (
+                    COLOR_VOICE if (key == 'Voice' and voice_mode) else COLOR_DEFAULT))
+            cv2.rectangle(frame, (x, y), (x + key_width, y + key_height), color, 2)
+            cv2.putText(frame, key, (x + 5, y + 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TEXT, 1)
+
+# Detect key under index finger
+def detect_key(finger_pos, start_x, start_y):
+    fx, fy = finger_pos
+    for i, row in enumerate(keyboard):
+        y = start_y + i * (key_height + key_gap)
+        if y - 15 < fy < y + key_height + 15:
+            for j, key in enumerate(row):
+                x = start_x + j * (key_width + key_gap)
+                if x - 15 < fx < x + key_width + 15:
+                    return key
+    return None
+
+# Check if circles overlap
+def circles_overlap(pos1, pos2, radius):
+    distance = np.linalg.norm(np.array(pos1) - np.array(pos2))
+    return distance < (radius * 2)
+
+# Voice listener thread
+def voice_listener():
+    global voice_command_display
+    while True:
+        if voice_mode:
+            try:
+                recording_signals.get()
+                print("Starting recording...")
+                with microphone as source:
+                    print("Adjusting for ambient noise...")
+                    recognizer.adjust_for_ambient_noise(source, duration=1)
+                    print("Recording for 5 seconds...")
+                    audio_data = recognizer.record(source, duration=5)
+                    print("Recording done.")
+                    try:
+                        command = recognizer.recognize_google(audio_data).lower()
+                        print(f"Recognized command: {command}")
+                        voice_command_display = f"You said: {command}"
+                        command_queue.put(command)
+                    except sr.UnknownValueError:
+                        print("Could not understand audio")
+                        voice_command_display = "Error: Could not understand audio"
+                        command_queue.put("Error: Could not understand audio")
+                    except sr.RequestError as e:
+                        print(f"Speech recognition request failed: {e}")
+                        voice_command_display = f"Error: {e}"
+                        command_queue.put(f"Error: {e}")
+                    except Exception as e:
+                        print(f"Unexpected error in voice listener: {e}")
+                        voice_command_display = f"Error: {e}"
+                        command_queue.put(f"Error: {e}")
+            except queue.Empty:
+                pass
+        time.sleep(0.01)
+
+# Process voice commands
+def process_voice_command(command):
+    global text_display, voice_command_display
+    if command.startswith("Error"):
+        voice_command_display = command
+    else:
+        text_display += command  # Display the full recognized word in the search bar
+        print(f"Added to search bar: {command}")
+
+# Start voice listener thread
+voice_thread = threading.Thread(target=voice_listener, daemon=True)
+voice_thread.start()
+
+# Main loop
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb_frame)
+    check_active_window()
+
+    frame_height, frame_width = frame.shape[:2]
+    start_x = (frame_width - len(keyboard[0]) * (key_width + key_gap)) // 2
+    start_y = (frame_height - len(keyboard) * (key_height + key_gap)) // 2
+    active_key = None
+
+    if voice_mode:
+        current_time = time.time()
+        elapsed_time = current_time - voice_activation_time
+        cycle_time = current_time - last_recording_start
+
+        if elapsed_time < 2:
+            voice_status = "Voice commands activated"
+        else:
+            voice_status = "Start speaking"
+            if cycle_time >= 7 or last_recording_start == 0:
+                recording_signals.put("start")
+                last_recording_start = current_time
+                print(f"New recording cycle started at {current_time}")
+
+    if not is_minimized:
+        draw_keyboard(frame, start_x, start_y, active_key)
+
+    if results.multi_hand_landmarks:
+        for hand_landmarks in results.multi_hand_landmarks:
+            lm_list = [(int(lm.x * frame_width), int(lm.y * frame_height)) for lm in hand_landmarks.landmark]
+            index_tip = lm_list[8]
+            thumb_tip = lm_list[4]
+            middle_tip = lm_list[12]
+
+            cv2.circle(frame, index_tip, circle_radius, COLOR_INDEX, 2)
+            cv2.circle(frame, thumb_tip, circle_radius, COLOR_THUMB, 2)
+            cv2.circle(frame, middle_tip, circle_radius, COLOR_MIDDLE, 2)
+            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+                                      landmark_drawing_spec=mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=1))
+
+            mouse_x = int(index_tip[0] * screen_width / frame_width)
+            mouse_y = int(index_tip[1] * screen_height / frame_height)
+
+            current_time = time.time()
+            index_thumb_touch = circles_overlap(index_tip, thumb_tip, circle_radius)
+            middle_index_touch = circles_overlap(middle_tip, index_tip, circle_radius)
+            three_fingers_touch = index_thumb_touch and middle_index_touch
+
+            if is_minimized:
+                pyautogui.moveTo(mouse_x, mouse_y)
+
+                if three_fingers_touch and (current_time - last_action_time) > debounce_time:
+                    win = gw.getWindowsWithTitle("Virtual Keyboard")
+                    if win:
+                        win[0].restore()
+                        is_minimized = False
+                        text_display = ""  # Clear text display when restored
+                    last_action_time = current_time
+                elif index_thumb_touch and (current_time - last_action_time) > debounce_time:
+                    pyautogui.leftClick()
+                    last_action_time = current_time
+                elif middle_index_touch and (current_time - last_action_time) > debounce_time:
+                    pyautogui.rightClick()
+                    last_action_time = current_time
+
+                # Scrolling only when minimized
+                if index_thumb_touch:
+                    if prev_pinch_y is None:
+                        prev_pinch_y = mouse_y
+                    else:
+                        delta_y = prev_pinch_y - mouse_y
+                        if delta_y > 0:
+                            pyautogui.scroll(-scroll_speed)
+                        elif delta_y < 0:
+                            pyautogui.scroll(scroll_speed)
+                        prev_pinch_y = mouse_y
+                else:
+                    prev_pinch_y = None
+            else:
+                # When not minimized
+                if volume_mode and index_thumb_touch:
+                    # Volume control
+                    delta_y = (screen_height / 2 - mouse_y) / (screen_height / 2)
+                    volume_range = volume.GetVolumeRange()
+                    new_volume = volume.GetMasterVolumeLevel() + delta_y * 1.5
+                    volume.SetMasterVolumeLevel(max(volume_range[0], min(volume_range[1], new_volume)), None)
+                elif index_thumb_touch and (current_time - last_action_time) > debounce_time:
+                    active_key = detect_key(index_tip, start_x, start_y)
+                    if active_key:
+                        if active_key in ['Min', 'Max', 'Open', 'Sound', 'Voice']:
+                            if active_key == 'Min':
+                                win = gw.getWindowsWithTitle("Virtual Keyboard")
+                                if win:
+                                    win[0].minimize()
+                                    is_minimized = True
+                            elif active_key == 'Max':
+                                win = gw.getWindowsWithTitle("Virtual Keyboard")
+                                if win:
+                                    win[0].restore()
+                                    is_minimized = False
+                            elif active_key == 'Open':
+                                os.system("explorer")
+                            elif active_key == 'Sound':
+                                volume_mode = not volume_mode
+                            elif active_key == 'Voice':
+                                voice_mode = not voice_mode
+                                if voice_mode:
+                                    voice_activation_time = time.time()
+                                    last_recording_start = 0
+                                    voice_status = "Voice commands activated"
+                                    voice_command_display = ""
+                                else:
+                                    voice_status = ""
+                                    voice_command_display = ""
+                        elif active_key == 'Enter':
+                            pyautogui.press('enter')
+                        elif active_key == '⌫':
+                            pyautogui.press('backspace')
+                            if text_display:
+                                text_display = text_display[:-1]
+                        else:
+                            pyautogui.typewrite(active_key)
+                            text_display += active_key
+                        last_action_time = current_time
+
+    if voice_mode:
+        try:
+            command = command_queue.get_nowait()
+            process_voice_command(command)
+        except queue.Empty:
+            pass
+
+    if not is_minimized:
+        draw_keyboard(frame, start_x, start_y, active_key)
+        cv2.imshow("Virtual Keyboard", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
